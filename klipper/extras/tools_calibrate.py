@@ -79,7 +79,7 @@ class ToolsCalibrate:
         left_x = self.probe_xy(toolhead, top_pos, 'x+', gcmd, samples=samples)
         right_x = self.probe_xy(toolhead, top_pos, 'x-', gcmd, samples=samples)
         near_y = self.probe_xy(toolhead, top_pos, 'y+', gcmd, samples=samples)
-        return [(left_x + right_x) / 2., (near_y + (right_x - left_x) / 2.]
+        return [(left_x + right_x) / 2., (near_y + (right_x - left_x) / 2.)]
 
     def locate_sensor(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
