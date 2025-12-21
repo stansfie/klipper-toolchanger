@@ -80,15 +80,23 @@ probe: probe
 ### Clean your nozzles 
 
 The calibration accuracy is as good as your nozzles are clean. 
-Clean all nozzles thoroughly before calibrating.
+Clean all nozzles thoroughly before calibrating - ```CLEAN_NOZZLE```
+
+- If using an eddy sensor, calibrate the nozzle using ```CARTOGRAPHER_TOUCH```
 
 ### Calibrating tool offsets
 
-- First position the nozzle approximately above the probe - the probe will find the center on it's own within 1-2 mm.
+- First position the nozzle approximately above the probe ```CALIBRATE_MOVE_OVER_PROBE``` - the probe will find the center on it's own within 1-2 mm.
+
+
+
+CLEAN_NOZZLE
+    CARTOGRAPHER_TOUCH DEBUG=1
 
 - The first tool has all offsets to 0 and is used as a baseline for other tools. Run ```TOOL_LOCATE_SENSOR``` to calibrate nozzle location for tool 0.
 
-- For every other tool, run ```TOOL_CALIBRATE_TOOL_OFFSET``` to measure the offset from the first tool.
+
+- For every other tool, repeat cleaning ```CLEAN_NOZZLE``` and ```CALIBRATE_MOVE_OVER_PROBE``` and run ```TOOL_CALIBRATE_TOOL_OFFSET``` to measure the offset from the first tool.
 
 All probing moves and final offsets will be printed in the console.
 

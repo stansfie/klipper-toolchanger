@@ -127,7 +127,8 @@ class ToolsCalibrate:
         location = self.locate_sensor(gcmd)
         self.last_result = [location[i] - self.sensor_location[i] for i in
                             range(3)]
-        self.gcode.respond_info("Tool offset is %.6f,%.6f,%.6f"
+
+        self.gcode.respond_info("Paste into your config file for tool:\n\ngcode_x_offset: %.6f\ngcode_y_offset: %.6f\ngcode_z_offset: %.6f\n"
                                 % (self.last_result[0], self.last_result[1],
                                    self.last_result[2]))
 
@@ -300,14 +301,14 @@ class PrinterProbeMultiAxis:
         logging.info("run_probe axis = %d, sense = %d" % (axis, sense))
 
         lift_speed = self.get_lift_speed(gcmd)
-        sample_count = gcmd.get_int("SAMPLES",
+        sample_count = gcmd.getint("SAMPLES",
                                     samples if samples else self.sample_count,
                                     minval=1)
         sample_retract_dist = gcmd.get_float("SAMPLE_RETRACT_DIST",
                                              self.sample_retract_dist, above=0.)
         samples_tolerance = gcmd.get_float("SAMPLES_TOLERANCE",
                                            self.samples_tolerance, minval=0.)
-        samples_retries = gcmd.get_int("SAMPLES_TOLERANCE_RETRIES",
+        samples_retries = gcmd.getint("SAMPLES_TOLERANCE_RETRIES",
                                        self.samples_retries, minval=0)
         samples_result = gcmd.get("SAMPLES_RESULT", self.samples_result)
 
