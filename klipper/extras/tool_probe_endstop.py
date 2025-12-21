@@ -116,7 +116,7 @@ class ToolProbeEndstop:
 
     cmd_SET_ACTIVE_TOOL_PROBE_help = "Set the tool probe that will act as the Z endstop."
     def cmd_SET_ACTIVE_TOOL_PROBE(self, gcmd):
-        probe_nr = gcmd.getint("T")
+        probe_nr = gcmd.get_int("T")
         if (probe_nr not in self.tool_probes):
             raise gcmd.error("SET_ACTIVE_TOOL_PROBE no tool probe for tool %d" % (probe_nr))
         self.set_active_probe(self.tool_probes[probe_nr])
@@ -148,7 +148,7 @@ class ToolProbeEndstop:
     def cmd_START_TOOL_PROBE_CRASH_DETECTION(self, gcmd):
         # Detect waits until previous print moves are finished to detect the triggers
         self.cmd_DETECT_ACTIVE_TOOL_PROBE(gcmd)
-        expected_tool_number = gcmd.getint("T", self.active_tool_number)
+        expected_tool_number = gcmd.get_int("T", self.active_tool_number)
 
         if expected_tool_number is None:
             raise gcmd.error("Cannot start probe crash detection - no active tool")

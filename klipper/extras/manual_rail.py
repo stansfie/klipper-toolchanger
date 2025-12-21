@@ -98,7 +98,7 @@ class ManualRail:
             phoming.manual_home(self, endstops, pos, hi.second_homing_speed, True, True)
     cmd_MANUAL_RAIL_help = "Command a manually configured rail"
     def cmd_MANUAL_RAIL(self, gcmd):
-        enable = gcmd.getint('ENABLE', None)
+        enable = gcmd.get_int('ENABLE', None)
         if enable is not None:
             self.do_enable(enable)
         setpos = gcmd.get_float('SET_POSITION', None)
@@ -106,19 +106,19 @@ class ManualRail:
             self.do_set_position(setpos)
         speed = gcmd.get_float('SPEED', self.velocity, above=0.)
         accel = gcmd.get_float('ACCEL', self.accel, minval=0.)
-        home = gcmd.getint('HOME', 0)
+        home = gcmd.get_int('HOME', 0)
         if home:
             self.do_enable(1)
             self.do_homing_move(accel=accel)
         elif gcmd.get_float('MOVE', None) is not None:
             movepos = gcmd.get_float('MOVE')
-            sync = gcmd.getint('SYNC', 1)
+            sync = gcmd.get_int('SYNC', 1)
             if self.rail.position_min is not None and movepos < self.rail.position_min:
                 raise gcmd.error('Stepper %s move to %s below min %s' % (self.rail.get_name(), movepos, self.rail.position_min))
             if self.rail.position_max is not None and movepos > self.rail.position_max:
                 raise gcmd.error('Stepper %s move to %s above max %s' % (self.rail.get_name(), movepos, self.rail.position_max))
             self.do_move(movepos, speed, accel, sync)
-        elif gcmd.getint('SYNC', 0):
+        elif gcmd.get_int('SYNC', 0):
             self.sync_print_time()
 
     def get_status(self, eventtime):

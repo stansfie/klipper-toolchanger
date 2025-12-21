@@ -166,7 +166,7 @@ class Toolchanger:
         tool = self.gcmd_tool(gcmd, self.detected_tool)
         was_error  = self.status == STATUS_ERROR
         self.initialize(tool)
-        if was_error and gcmd.getint("RECOVER", default=0) == 1:
+        if was_error and gcmd.get_int("RECOVER", default=0) == 1:
             if not tool:
                 raise gcmd.error("Cannot recover, no tool")
             self._recover_position(gcmd, tool)
@@ -181,7 +181,7 @@ class Toolchanger:
             restore_axis = gcmd.get('RESTORE_AXIS', tool.t_command_restore_axis)
             self.select_tool(gcmd, tool, restore_axis)
             return
-        tool_nr = gcmd.getint('T', None)
+        tool_nr = gcmd.get_int('T', None)
         if tool_nr is not None:
             tool = self.lookup_tool(tool_nr)
             if not tool:
@@ -195,7 +195,7 @@ class Toolchanger:
 
     def cmd_SET_TOOL_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
-        wait = gcmd.getint('WAIT', 0) == 1
+        wait = gcmd.get_int('WAIT', 0) == 1
         tool = self._get_tool_from_gcmd(gcmd)
         if not tool.extruder:
             raise gcmd.error(
@@ -206,7 +206,7 @@ class Toolchanger:
 
     def _get_tool_from_gcmd(self, gcmd):
         tool_name = gcmd.get('TOOL', None)
-        tool_nr = gcmd.getint('T', None)
+        tool_nr = gcmd.get_int('T', None)
         if tool_name:
             tool = self.printer.lookup_object(tool_name)
         elif tool_nr is not None:
@@ -498,7 +498,7 @@ class Toolchanger:
             return
         toolhead = self.printer.lookup_object('toolhead')
         reactor = self.printer.get_reactor()
-        if gcmd.getint("ASYNC", 0) == 1:
+        if gcmd.get_int("ASYNC", 0) == 1:
             if self.error_gcode is None:
                 raise gcmd.error("VERIFY_TOOL_DETECTED ASYNC=1 needs error_gcode to be defined")
             def timer_handler(reactor_time) :
@@ -649,9 +649,9 @@ class Toolchanger:
 
     def gcmd_tool(self, gcmd, default=sentinel, extra_number_arg=None):
         tool_name = gcmd.get('TOOL', None)
-        tool_number = gcmd.getint('T', None)
+        tool_number = gcmd.get_int('T', None)
         if tool_number is None and extra_number_arg:
-            tool_number = gcmd.getint(extra_number_arg, None)
+            tool_number = gcmd.get_int(extra_number_arg, None)
         tool = None
         if tool_name:
             tool = self.printer.lookup_object(tool_name)
