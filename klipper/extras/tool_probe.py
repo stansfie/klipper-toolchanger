@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 from . import probe
+from . import probe_helpers
 
 class ToolProbe:
     def __init__(self, config):
@@ -12,7 +13,7 @@ class ToolProbe:
         self.printer = config.get_printer()
         self.name = config.get_name()
         self.mcu_probe = probe.ProbeEndstopWrapper(config)
-        self.probe_offsets = probe.ProbeOffsetsHelper(config)
+        self.probe_offsets = probe_helpers.ProbeOffsetsHelper(config)
         self.probe_session = ProbeSessionHelper(config, self.mcu_probe)
 
         # Crash detection stuff
