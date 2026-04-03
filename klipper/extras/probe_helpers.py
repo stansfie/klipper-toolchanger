@@ -5,6 +5,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import pins
 from . import manual_probe
 
 HINT_TIMEOUT = """
@@ -79,9 +80,35 @@ class HomingViaProbeHelper:
             self.z_min_position = pconfig.getfloat('minimum_z_position', 0.,
                                                     note_valid=False)
         self.results = []
+        # Register z_virtual_endstop pin
+        self.printer.lookup_object('pins').register_chip('probe', self)
         # Register event handlers
+        self.printer.register_event_handler("homing:homing_move_begin",
+                                             self._handle_homing_move_begin)
+        self.printer.register_event_handler("homing:homing_move_end",
+                                             self._handle_homing_move_end)
+        self.printer.register_event_handler("homing:home_rails_begin",
+                                             self._handle_home_rails_begin)
+        self.printer.register_event_handler("homing:home_rails_end",
+                                             self._handle_home_rails_end)
         self.printer.register_event_handler("gcode:command_error",
                                              self._handle_command_error)
+    def _handle_homing_move_begin(self, hmove):
+        if self.mcu_probe in hmove.get_mcu_endstops():
+            self.mcu_probe.probe_prepare(hmove)
+    def _handle_homing_move_end(self, hmove):
+        if self.mcu_probe in hmove.get_mcu_endstops():
+            self.mcu_probe.probe_finish(hmove)
+    def _handle_home_rails_begin(self, homing_state, rails):
+        endstops = [es for rail in rails for es, name in rail.get_endstops()]
+        if self.mcu_probe in endstops:
+            self.mcu_probe.multi_probe_begin()
+            self.multi_probe_pending = True
+    def _handle_home_rails_end(self, homing_state, rails):
+        endstops = [es for rail in rails for es, name in rail.get_endstops()]
+        if self.multi_probe_pending and self.mcu_probe in endstops:
+            self.multi_probe_pending = False
+            self.mcu_probe.multi_probe_end()
     def _handle_command_error(self):
         if self.multi_probe_pending:
             self.multi_probe_pending = False
@@ -89,6 +116,12 @@ class HomingViaProbeHelper:
                 self.mcu_probe.multi_probe_end()
             except:
                 logging.exception("Homing multi-probe end")
+    def setup_pin(self, pin_type, pin_params):
+        if pin_type != 'endstop' or pin_params['pin'] != 'z_virtual_endstop':
+            raise pins.error("Probe virtual endstop only useful as endstop pin")
+        if pin_params['invert'] or pin_params['pullup']:
+            raise pins.error("Can not pullup/invert probe virtual endstop")
+        return self.mcu_probe
     def start_probe_session(self, gcmd):
         self.mcu_probe.multi_probe_begin()
         self.results = []
