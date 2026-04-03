@@ -21,10 +21,11 @@ class ToolProbeEndstop:
         self.crash_detection_active = False
         self.crash_lasttime = 0.
         self.mcu_probe = EndstopRouter(self.printer)
-        self.param_helper = probe.ProbeParameterHelper(config)
-        self.homing_helper = probe.HomingViaProbeHelper(config, self.mcu_probe, self.param_helper)
-        self.probe_session = probe.ProbeSessionHelper(config, self.param_helper, self.homing_helper.start_probe_session)
-        self.cmd_helper = probe.ProbeCommandHelper(config, self, self.mcu_probe.query_endstop)
+        # NOTE: Commented out - these helpers are not available in older Klipper versions
+        # self.param_helper = probe.ProbeParameterHelper(config)
+        # self.homing_helper = probe.HomingViaProbeHelper(config, self.mcu_probe, self.param_helper)
+        # self.probe_session = probe.ProbeSessionHelper(config, self.param_helper, self.homing_helper.start_probe_session)
+        # self.cmd_helper = probe.ProbeCommandHelper(config, self, self.mcu_probe.query_endstop)
 
         # Emulate the probe object, since others rely on this.
         if self.printer.lookup_object('probe', default=None):
@@ -133,9 +134,11 @@ class ToolProbeEndstop:
             gcmd.respond_info(self._describe_tool_detection_issue(active_tools))
 
     def get_status(self, eventtime):
-        status = self.cmd_helper.get_status(eventtime)
-        status['last_tools_query'] = self.last_query
-        status['active_tool_number'] = self.active_tool_number
+        # Provide basic status without cmd_helper (not available in older Klipper)
+        status = {
+            'last_tools_query': self.last_query,
+            'active_tool_number': self.active_tool_number,
+        }
         if self.active_probe:
             status['active_tool_probe'] = self.active_probe.name
             status['active_tool_probe_z_offset'] = self.active_probe.get_offsets()[2]
