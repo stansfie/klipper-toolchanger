@@ -79,20 +79,6 @@ and will provide a default value for all of its tools.
 # recover_gcode:
   # Experimental, if specified, this gcode is run on `INITIALIZE_TOOLCHANGER RECOVER=1` to recover the position.
   # Should not generally be necessary, but adds optional extra control.
-# parent_tool:
-  # Name of a parent tool. Marks this toolchanger as a child, meaning the parent tool
-  # will be selected in order to select any tool attached to this.
-  # Can be used for chaining multiple filament/tool changing techniques,
-  # like IDEX plus an MMU attached to one of the hotends.
-# parent_mounting_mode: parent-first 
-  # How to mount parent when the tool is selected:
-  # - parent-first - mount parent and then child
-  # - child-first - mount child before parent can be mounted
-# parent_unmounting_mode: lazy 
-  # How to unmount parent when the tool is deselected:
-  # - child-first - unmount child and then parent
-  # - parent-first - unmount parent and then child
-  # - lazy - no dot unmount the child unless a needed to mount a sibling
 # transfer_fan_speed: True
   # When tre, fan speed is transferred during toolchange. When false, fan speeds are not changed during toolchange.     
 ```
@@ -123,6 +109,8 @@ All gcode macros below have the following context available:
 # extruder:
   # Name of the extruder to activate when this tool is selected.
   # If not specified, will use parent's extruder.
+# heater:
+  # Name of the heater to use, will override extuder's heater when specificed.  
 # extruder_stepper: 
   # Name of extruder stepper to use for filament motion.
   # When set the main extruder is only used for temperature control.
@@ -130,8 +118,15 @@ All gcode macros below have the following context available:
 # fan: 
   # Name of the fan to use as print cooling fan when this tool is selected.
   # If not set, uses parent fan or does nothing.
+# tool_probe:
+  # tool_probe to use for Z homing.
+  # If set, needs to be preset on all tools and a probe object is automatically registerd.
+  # The toolchanger needs to be initialized before Z homing for the probe to work.
 # detection_pin: 
-  # Pin to use for tool presence detection.
+  # Pin to use for tool presence detection: 
+  #  - when triggered, the tool is absent
+  #  - when not triggered, the tool is mounted
+  # Note: to allow sharing a pin for both tool detection and probing, the semantics are inverted.   
 # tool_number: 
   # Tool number to register this tool as.
   # When set, creates the T<n> macro and changes M104/M109 T<n> to target this tool.
@@ -147,7 +142,9 @@ All gcode macros below have the following context available:
 # gcode_z_offset: 0
   # The XYZ gcode offset of the toolhead. If set, overrides offset defined 
   # by the parent. If set, even to 0, indicates the offset on that axis is 
-  # relevant for this tool and any adjustments will be attributed to this tool.  
+  # relevant for this tool and any adjustments will be attributed to this tool.
+  # The tool gcode offsets are applied independantly from user Gcode offsets. 
+  # User Gcode offsets are preserved across tool changes.    
 # params_*: 
   # Extra params to pass to pickup/dropoff gcode. Accessible in the gcode via
   # `tool.params_name`.
@@ -158,6 +155,10 @@ All gcode macros below have the following context available:
   #  params_retract_mm: 8 
 # t_command_restore_axis: XYZ
    # Which axis to restore with the T<n> command, see SELECT_TOOL for command for more info.
+# abort_on_tool_missing: False
+  # Detects if tool goes missing during a print and calls `toolchanger.error_gcode`.
+# tool_missing_delay: 2.0
+  # Delay in seconds before triggering the tool missing logic. 
 ```
 
 # Gcodes
@@ -227,11 +228,20 @@ A verification failure will:
  - abort in-progress toolchange, put the toolchanger in `ERROR` state.
  - Run`error_gcode` if one is provided. 
 
+### ADJUST_Z_AFTER_TOOL_NOZZLE_HOME
+`ADJUST_Z_AFTER_TOOL_NOZZLE_HOME`: Adjust toolhead Z position after bed probing to account for tool Z offset.
+
 ### SET_TOOL_TEMPERATURE
 `SET_TOOL_TEMPERATURE [TOOL=<name>] [T=<number>]  TARGET=<temp> [WAIT=0]`: Set tool temperature.
 
+### ENTER_DOCIKING_MODE
+`ENTER_DOCKING_MODE`: Manually enter docking mode, with tool and gcode offsets cleared. Primarily for dock alignment.
+
+### EXIT_DOCIKING_MODE
+`EXIT_DOCKING_MODE`: Exit manual docking mode.
+
 ### TEST_TOOL_DOCKING
-`TEST_TOOL_DOCKING`: Dock and undock current tool.
+`TEST_TOOL_DOCKING`: Dock and undock current tool. Requires manual docking mode.
 
 ### SET_TOOL_PARAMETER
 `SET_TOOL_PARAMETER [TOOL=<name>] [T=<number>]  PARAMETER=parameter_<name> VALUE=<value>`: 
@@ -273,6 +283,10 @@ The following information is available in the `tool` object:
  - `mounted`: If this tool is currently mounted, the tool may be mounted but
    not selected. Some reasons for that can be that a child tool is selected, or
    lazy unmounting is configured.  
+- `detect_state`: Tool detection state, may be different from mounted state if the tool was manually replaced.
+  "unavailable" if tool detection is not available
+  "mounted" if the tool is mounted
+  "absent" if tool is not mounted
  - `mounted_child`: The child tool which is currently mounted, or empty.
  - `params_*`: Set of values specified using params_*.
  - `gcode_x_offset`: current X offset.

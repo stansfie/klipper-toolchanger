@@ -4,8 +4,9 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import ast, bisect
+import ast, bisect, logging
 from unittest.mock import sentinel
+from . import tool_probe_endstop
 
 STATUS_UNINITALIZED = 'uninitialized'
 STATUS_INITIALIZING = 'initializing'
@@ -19,10 +20,74 @@ ON_AXIS_NOT_HOMED_ABORT = 0
 ON_AXIS_NOT_HOMED_HOME = 1
 XYZ_TO_INDEX = {'x': 0, 'X': 0, 'y': 1, 'Y': 1, 'z': 2, 'Z': 2}
 INDEX_TO_XYZ = 'XYZ'
-DETECT_UNAVAILABLE = -1
-DETECT_ABSENT = 0
-DETECT_PRESENT = 1
+DETECT_UNAVAILABLE = "unavailable"
+DETECT_ABSENT = "absent"
+DETECT_PRESENT = "mounted"
 
+_FUTURE = 9999999999999999.
+
+class Interval:
+    def __init__(self, start):
+        self.start = start
+        self.end = _FUTURE
+
+class ToolMissingHelper:
+    def __init__(self, toolchanger, config):
+        self.printer = config.get_printer()
+        self.toolchanger = toolchanger
+        self.reactor = self.printer.get_reactor()
+        self.enabled = config.getboolean('abort_on_tool_missing', False)
+        self.wait_time = config.getfloat('tool_missing_delay', 2.0, above=0.)
+        # Keep a log of last 10 active intervals. Probably an overkill.
+        self.active_intervals = []
+        self.missing_lasttime = 0.
+        self.printer.register_event_handler('klippy:connect',
+                                            self._handle_connect)
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.sdcard = self.printer.lookup_object('virtual_sdcard')
+
+    def activate(self):
+        if self.enabled:
+            self.toolhead.register_lookahead_callback(lambda t: self.activate_at_time(t))
+    def deactivate(self):
+        if self.enabled:
+            self.toolhead.register_lookahead_callback(lambda t: self.deactivate_at_time(t))
+
+    def activate_at_time(self, time):
+        if len(self.active_intervals) == 0 or self.active_intervals[-1].end <= time:
+            self.active_intervals.append(Interval(time))
+        if len(self.active_intervals) > 10:
+            del self.active_intervals[0]
+
+    def deactivate_at_time(self, time):
+        if len(self.active_intervals) > 0 and self.active_intervals[-1].end >= time:
+            self.active_intervals[-1].end = time
+
+    def note_tool_change(self, eventtime):
+        if self.toolchanger.detected_tool != self.toolchanger.active_tool:
+            self.missing_lasttime = eventtime
+            logging.warning(f"Tool missing detected, waiting {self.wait_time} seconds to trigger.")
+            self.reactor.register_callback(lambda _: self._tool_missing_delayed(eventtime),
+                                           eventtime + self.wait_time)
+        else:
+            self.missing_lasttime = 0.
+
+    def was_active_between(self, start, end):
+        return any([i.start <= end and i.end >= start for i in self.active_intervals])
+
+    def _tool_missing_delayed(self, crashtime):
+        if self.missing_lasttime != crashtime:
+            logging.warning(f"Tool missing trigger was cancelled, cleared before timeout")
+        elif not self.sdcard.is_active():
+            logging.warning(f"Tool missing trigger was cancelled, no active print")
+        elif not self.was_active_between(crashtime, crashtime + self.wait_time):
+            logging.warning(f"Tool missing trigger was cancelled, detection not active.")
+        else:
+            self.active_intervals = []
+            logging.error(f"Tool missing after wait time, erroring out!!!")
+            self.toolchanger.process_error(None, "Tool no longer attached.")
 
 class Toolchanger:
     def __init__(self, config):
@@ -54,6 +119,8 @@ class Toolchanger:
         self.default_after_change_gcode = self.gcode_macro.load_template(
             config, 'after_change_gcode', '')
 
+        self.tool_missing_helper = ToolMissingHelper(self, config)
+
         # Read all the fields that might be defined on toolchanger.
         # To avoid throwing config error when no tools configured.
         config.get('pickup_gcode', None)
@@ -77,7 +144,10 @@ class Toolchanger:
         self.error_message = ''
         self.next_change_id = 1
         self.current_change_id = -1
+        self.gcode_transform = ToolGcodeTransform()
 
+        self.printer.register_event_handler("gcode:command_error",
+                                            self._handle_command_error)
         self.printer.register_event_handler("homing:home_rails_begin",
                                             self._handle_home_rails_begin)
         self.printer.register_event_handler('klippy:connect',
@@ -100,6 +170,12 @@ class Toolchanger:
             self.gcode.register_command("UNSELECT_TOOL",
                                         self.cmd_UNSELECT_TOOL,
                                         desc=self.cmd_UNSELECT_TOOL_help)
+        self.gcode.register_command("ENTER_DOCKING_MODE",
+                                    self.cmd_ENTER_DOCKING_MODE,
+                                    desc="Manually enter docking mode")
+        self.gcode.register_command("EXIT_DOCKING_MODE",
+                                    self.cmd_EXIT_DOCKING_MODE,
+                                    desc="Manually exit docking mode")
         self.gcode.register_command("TEST_TOOL_DOCKING",
                                     self.cmd_TEST_TOOL_DOCKING,
                                     desc=self.cmd_TEST_TOOL_DOCKING_help)
@@ -111,12 +187,20 @@ class Toolchanger:
                                     self.cmd_SAVE_TOOL_PARAMETER)
         self.gcode.register_command("VERIFY_TOOL_DETECTED",
                                     self.cmd_VERIFY_TOOL_DETECTED)
+        self.gcode.register_command("ADJUST_Z_AFTER_TOOL_NOZZLE_HOME",
+                                    self.cmd_ADJUST_Z_AFTER_TOOL_NOZZLE_HOME)
         self.fan_switcher = None
+        self.tool_probe_endstop = None
         self.validate_tool_timer = None
 
     def require_fan_switcher(self):
         if not self.fan_switcher:
             self.fan_switcher = FanSwitcher(self, self.config)
+
+    def add_probe(self, probe):
+        if not self.tool_probe_endstop:
+            self.tool_probe_endstop = tool_probe_endstop.ToolProbeEndstop(self.config, standalone=False)
+        self.tool_probe_endstop.add_probe(self.config, probe)
 
     def _handle_home_rails_begin(self, homing_state, rails):
         if self.initialize_on == INIT_ON_HOME and self.status == STATUS_UNINITALIZED:
@@ -125,10 +209,19 @@ class Toolchanger:
     def _handle_connect(self):
         self.status = STATUS_UNINITALIZED
         self.active_tool = None
+        self.gcode_transform.next_transform = self.gcode_move.set_move_transform(self.gcode_transform, force=True)
+
+    def _handle_command_error(self):
+        self.status = STATUS_UNINITALIZED
+        self.tool_missing_helper.deactivate()
+        self.active_tool = None
+        self.gcode_transform.tool = None
 
     def _handle_shutdown(self):
         self.status = STATUS_UNINITALIZED
+        self.tool_missing_helper.deactivate_at_time(_FUTURE)
         self.active_tool = None
+        self.gcode_transform.tool = None
 
     def get_status(self, eventtime):
         return {**self.params,
@@ -159,9 +252,12 @@ class Toolchanger:
         all_detection = all([t.detect_state != DETECT_UNAVAILABLE for t in self.tools.values()])
         if self.has_detection and not all_detection:
             raise self.config.error("Some tools missing detection pin")
+        has_probe = any([t.probe is not None for t in self.tools.values()])
+        all_probe = all([t.probe is not None for t in self.tools.values()])
+        if has_probe and not all_probe:
+            raise self.config.error("Some tools are missing tool_probe")
 
     cmd_INITIALIZE_TOOLCHANGER_help = "Initialize the toolchanger"
-
     def cmd_INITIALIZE_TOOLCHANGER(self, gcmd):
         tool = self.gcmd_tool(gcmd, self.detected_tool)
         was_error  = self.status == STATUS_ERROR
@@ -197,12 +293,12 @@ class Toolchanger:
         temp = gcmd.get_float('TARGET', 0.)
         wait = gcmd.get_int('WAIT', 0) == 1
         tool = self._get_tool_from_gcmd(gcmd)
-        if not tool.extruder:
+        if not tool.heater:
             raise gcmd.error(
-                "SET_TOOL_TEMPERATURE: No extruder specified for tool %s" % (
+                "SET_TOOL_TEMPERATURE: No extruder or heater specified for tool %s" % (
                     tool.name))
         heaters = self.printer.lookup_object('heaters')
-        heaters.set_temperature(tool.extruder.get_heater(), temp, wait)
+        heaters.set_temperature(tool.heater, temp, wait)
 
     def _get_tool_from_gcmd(self, gcmd):
         tool_name = gcmd.get('TOOL', None)
@@ -228,7 +324,7 @@ class Toolchanger:
                 'SELECT_TOOL_ERROR called while not selecting, doing nothing')
             return
         message = gcmd.get('MESSAGE', '')
-        self._process_error(gcmd.error, message)
+        self.process_error(gcmd.error, message)
 
     cmd_UNSELECT_TOOL_help = "Unselect active tool without selecting a new one"
     def cmd_UNSELECT_TOOL(self, gcmd):
@@ -238,11 +334,28 @@ class Toolchanger:
                                 self.active_tool.t_command_restore_axis)
         self.select_tool(gcmd, None, restore_axis)
 
-    cmd_TEST_TOOL_DOCKING_help = "Unselect active tool and select it again"
+    def cmd_ENTER_DOCKING_MODE(self, gcmd):
+        if self.status == STATUS_UNINITALIZED and self.initialize_on == INIT_FIRST_USE:
+            self.initialize(self.detected_tool)
+        if self.status != STATUS_READY:
+            raise gcmd.error(
+                "Cannot enter docking mode, toolchanger status is %s, reason: %s" % (self.status, self.error_message))
+        self.status = STATUS_CHANGING
+        self.tool_missing_helper.deactivate()
+        self._save_state("", None)
+        self._set_toolchange_transform()
 
+    def cmd_EXIT_DOCKING_MODE(self, gcmd):
+        if self.status != STATUS_CHANGING:
+            raise gcmd.error(
+                "Cannot exit docking mode, toolchanger status is %s, reason: %s" % (self.status, self.error_message))
+
+        self._restore_state_and_transform(self.active_tool)
+        self.status = STATUS_READY
+        self.tool_missing_helper.activate()
+
+    cmd_TEST_TOOL_DOCKING_help = "Unselect active tool and select it again"
     def cmd_TEST_TOOL_DOCKING(self, gcmd):
-        if not self.active_tool:
-            raise gcmd.error("Cannot test tool, no active tool")
         restore_axis = gcmd.get('RESTORE_AXIS',
                                 self.active_tool.t_command_restore_axis)
         self.test_tool_selection(gcmd, restore_axis)
@@ -268,7 +381,7 @@ class Toolchanger:
             self._configure_toolhead_for_tool(select_tool)
             if select_tool:
                 self.run_gcode('after_change_gcode', select_tool.after_change_gcode, extra_context)
-                self._set_tool_gcode_offset(select_tool, 0.0)
+                self.gcode_transform.tool = select_tool
             if self.require_tool_present and self.active_tool is None:
                 raise self.gcode.error(
                     '%s failed to initialize, require_tool_present set and no tool present after initialization' % (
@@ -277,6 +390,7 @@ class Toolchanger:
         if should_run_initialize:
             if self.status == STATUS_INITIALIZING:
                 self.status = STATUS_READY
+                self.tool_missing_helper.activate()
                 self.gcode.respond_info('%s initialized, active %s' %
                                         (self.name,
                                          self.active_tool.name if self.active_tool else None))
@@ -302,42 +416,21 @@ class Toolchanger:
         try:
             self.ensure_homed(gcmd)
             self.status = STATUS_CHANGING
+            self._save_state(restore_axis, tool)
 
-            # What is going on here:
-            #  - toolhead position - the position of the toolhead mount relative to homing sensors.
-            #  - gcode position - the position of the nozzle, relative to the bed;
-            #      since each tool has a slightly different geometry, each tool has a set of gcode offsets that determine the delta.
-            # Normally gcode commands use gcode position, but that can mean different toolhead positions depending on
-            # which tool is mounted, making tool changes unreliable.
-            # To solve that, during toolchange Gcode offsets are set to zero and the gcode moves directly work with toolhead position.
-            # And nozzle location will deviate for each tool.
-            #
-            # To restore the new tool's nozzle to where the previous tool left off, the restore position is manually computed in the code below.
-            gcode_status = self.gcode_move.get_status()
-            gcode_position = gcode_status['gcode_position']
-            current_z_offset = gcode_status['homing_origin'][2] # Current Z offset applied; Contains both the tool offset plus any manual changes by the user.
-            extra_z_offset = current_z_offset - (self.active_tool.gcode_z_offset if self.active_tool else 0.0)
-
-            self.last_change_gcode_position = gcode_position
-            self.last_change_start_position = self._position_to_xyz(gcode_position, 'xyz')
-            self.last_change_restore_position = self._position_to_xyz(gcode_position, restore_axis)
-            self.last_change_restore_axis = restore_axis
-            self.last_change_extra_z_offset = extra_z_offset
-            self.last_change_pickup_tool = tool
-
+            start_position = self._position_with_tool_offset(self.last_change_gcode_position, tool)
             extra_context = {
                 'dropoff_tool': self.active_tool.name if self.active_tool else None,
                 'pickup_tool': tool.name if tool else None,
-                'start_position': self._position_with_tool_offset(gcode_position, 'xyz', tool, extra_z_offset),
-                'restore_position': self._position_with_tool_offset(gcode_position, restore_axis, tool, extra_z_offset),
+                'start_position': self._position_to_xyz(start_position, 'xyz'),
+                'restore_position': self._position_to_xyz(start_position, restore_axis),
             }
-
-            self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=_toolchange_state")
 
             before_change_gcode = self.active_tool.before_change_gcode if self.active_tool else self.default_before_change_gcode
             self.run_gcode('before_change_gcode', before_change_gcode, extra_context)
-            self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0.0 Y=0.0 Z=0.0")
+            self._set_toolchange_transform()
 
+            self.tool_missing_helper.deactivate()
             if self.active_tool:
                 self.run_gcode('tool.dropoff_gcode',
                                self.active_tool.dropoff_gcode, extra_context)
@@ -348,17 +441,11 @@ class Toolchanger:
                                tool.pickup_gcode, extra_context)
                 if self.has_detection and self.verify_tool_pickup:
                     self.validate_detected_tool(tool, respond_info=gcmd.respond_info, raise_error=gcmd.error)
+                self.tool_missing_helper.activate()
                 self.run_gcode('after_change_gcode',
                                tool.after_change_gcode, extra_context)
 
-            self._restore_axis(gcode_position, restore_axis, tool)
-
-            self.gcode.run_script_from_command(
-                "RESTORE_GCODE_STATE NAME=_toolchange_state MOVE=0")
-            # Restore state sets old gcode offsets, fix that.
-            if tool is not None:
-                self._set_tool_gcode_offset(tool, extra_z_offset)
-
+            self._restore_state_and_transform(tool)
             self.status = STATUS_READY
             if tool:
                 gcmd.respond_info(
@@ -375,7 +462,7 @@ class Toolchanger:
                 self.current_change_id = -1
                 raise
 
-    def _process_error(self, raise_error, message):
+    def process_error(self, raise_error, message):
         self.status = STATUS_ERROR
         self.error_message = message
         is_inside_toolchange = self.current_change_id != -1
@@ -384,9 +471,10 @@ class Toolchanger:
         if self.error_gcode:
             extra_context = {}
             if is_inside_toolchange:
+                start_position = self._position_with_tool_offset(self.last_change_gcode_position, self.last_change_pickup_tool)
                 extra_context = {
-                    'start_position': self.last_change_start_position,
-                    'restore_position': self.last_change_restore_position,
+                    'start_position': self._position_to_xyz(start_position, "xyz"),
+                    'restore_position': self._position_to_xyz(start_position, self.last_change_restore_axis),
                     'pickup_tool': self.last_change_pickup_tool,
                 }
                 # Restore gcode state, but do not move. Prepare for error_gcode to run pause and capture the state for resume.
@@ -398,56 +486,44 @@ class Toolchanger:
                 # Manually transfer over before toolchange position to paused gcode state, Restore/Save looses that.
                 pause_state = self.gcode_move.saved_states.get('PAUSE_STATE', None)
                 if pause_state and self.last_change_pickup_tool:
-                    pause_state['last_position'] = [self.last_change_gcode_position[0] + self.last_change_pickup_tool.gcode_x_offset,
-                                                    self.last_change_gcode_position[1] + self.last_change_pickup_tool.gcode_y_offset,
-                                                    self.last_change_gcode_position[2] + self.last_change_pickup_tool.gcode_z_offset + self.last_change_extra_z_offset,
-                                                    self.last_change_gcode_position[3]]
+                    pause_state['last_position'] = self.last_change_gcode_position
 
         # Bail out rest of the gcmd execution.
         if raise_error:
             raise raise_error(message)
 
     def _recover_position(self, gcmd, tool):
+        start_position = self._position_with_tool_offset(self.last_change_gcode_position, tool)
         extra_context = {
             'pickup_tool': tool.name if tool else None,
-            'start_position': self.last_change_start_position,
-            'restore_position': self.last_change_restore_position,
+            'start_position': self._position_to_xyz(start_position, "xyz"),
+            'restore_position': self._position_to_xyz(start_position, self.last_change_restore_axis),
         }
         self.run_gcode('recover_gcode', tool.recover_gcode, extra_context)
-        self._restore_axis(self.last_change_gcode_position, self.last_change_restore_axis, tool)
-        self.gcode.run_script_from_command(
-            "RESTORE_GCODE_STATE NAME=_toolchange_state MOVE=0")
-        # Restore state sets old gcode offsets, fix that.
-        self._set_tool_gcode_offset(tool, self.last_change_extra_z_offset)
+        self._restore_state_and_transform(tool)
 
     def test_tool_selection(self, gcmd, restore_axis):
-        if self.status != STATUS_READY:
-            raise gcmd.error(
-                "Cannot test tool, toolchanger status is %s" % (self.status,))
+        if self.status != STATUS_CHANGING:
+            raise self.gcode.error(
+                "Docking test requires STATUS_CHANGING, status is %s" % (self.status,))
         tool = self.active_tool
         if not tool:
             raise gcmd.error("Cannot test tool, no active tool")
 
-        self.status = STATUS_CHANGING
-        gcode_position = self.gcode_move.get_status()['gcode_position']
+        gcode_position = list(self.gcode_move.get_status()['gcode_position'])
+        start_position = self._position_with_tool_offset(gcode_position, None)
         extra_context = {
-            'dropoff_tool': self.active_tool.name if self.active_tool else None,
+            'dropoff_tool': tool.name if tool else None,
             'pickup_tool': tool.name if tool else None,
-            'restore_position': self._position_with_tool_offset(
-                gcode_position, restore_axis, None),
-            'start_position': self._position_with_tool_offset(
-                gcode_position, 'xyz', tool)
+            'start_position': self._position_to_xyz(start_position,'xyz'),
+            'restore_position': self._position_to_xyz(start_position, restore_axis),
         }
-
-        self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0.0 Y=0.0 Z=0.0")
 
         self.run_gcode('tool.dropoff_gcode',
                        self.active_tool.dropoff_gcode, extra_context)
         self.run_gcode('tool.pickup_gcode',
                        tool.pickup_gcode, extra_context)
-
-        self._restore_axis(gcode_position, restore_axis, None)
-        self.status = STATUS_READY
+        self._restore_axis(gcode_position, restore_axis)
         gcmd.respond_info('Tool testing done')
 
     def lookup_tool(self, number):
@@ -456,7 +532,7 @@ class Toolchanger:
     def get_selected_tool(self):
         return self.active_tool
 
-    def note_detect_change(self, tool):
+    def note_detect_change(self, tool, eventtime):
         detected = None
         detected_names = []
         for tool in self.tools.values():
@@ -464,9 +540,9 @@ class Toolchanger:
                 detected = tool
                 detected_names.append(tool.name)
         if len(detected_names) > 1:
-            self.gcode.respond_info("Multiple tools detected: %s" % (detected_names,))
             detected = None
         self.detected_tool = detected
+        self.tool_missing_helper.note_tool_change(eventtime)
 
     def require_detected_tool(self, respond_info):
         if self.detected_tool is not None:
@@ -489,7 +565,7 @@ class Toolchanger:
             expected_name = expected.name if expected else "None"
             actual_name = actual.name if actual else "None"
             message = "Expected tool %s but active is %s" % (expected_name, actual_name)
-            self._process_error(raise_error, message)
+            self.process_error(raise_error, message)
 
     def cmd_VERIFY_TOOL_DETECTED(self, gcmd):
         self._ensure_toolchanger_ready(gcmd)
@@ -518,61 +594,81 @@ class Toolchanger:
         if self.active_tool:
             self.active_tool.deactivate()
         self.active_tool = tool
+        if self.tool_probe_endstop:
+            probe = tool.probe if tool else None
+            self.tool_probe_endstop.set_active_probe(probe)
         if self.active_tool:
             self.active_tool.activate()
 
-    def _set_tool_gcode_offset(self, tool, extra_z_offset):
-        if tool is None:
-            return
-        if tool.gcode_x_offset is None and tool.gcode_y_offset is None and tool.gcode_z_offset is None:
-            return
-        cmd = 'SET_GCODE_OFFSET'
-        if tool.gcode_x_offset is not None:
-            cmd += ' X=%f' % (tool.gcode_x_offset,)
-        if tool.gcode_y_offset is not None:
-            cmd += ' Y=%f' % (tool.gcode_y_offset,)
-        if tool.gcode_z_offset is not None:
-            cmd += ' Z=%f' % (tool.gcode_z_offset + extra_z_offset,)
-        self.gcode.run_script_from_command(cmd)
-        mesh = self.printer.lookup_object('bed_mesh', default=None)
-        if mesh and mesh.get_mesh():
-            self.gcode.run_script_from_command(
-                'BED_MESH_OFFSET X=%.6f Y=%.6f ZFADE=%.6f' %
-                (-tool.gcode_x_offset, -tool.gcode_y_offset,
-                 -tool.gcode_z_offset))
-
     def _position_to_xyz(self, position, axis):
+        if len(position) < 3:
+            raise Exception(f"Invalid position: {position}")
         result = {}
         for i in axis:
             index = XYZ_TO_INDEX[i]
             result[INDEX_TO_XYZ[index]] = position[index]
         return result
 
-    def _position_with_tool_offset(self, position, axis, tool, extra_z_offset=0.0):
-        result = {}
-        for i in axis:
-            index = XYZ_TO_INDEX[i]
-            v = position[index]
+    # Position with tool transforms applied. To be used while toolchanging to get a gcode position.
+    def _position_with_tool_offset(self, position, tool):
+        if len(position) < 3:
+            raise Exception(f"Invalid position: {position}")
+        result = []
+        for i in range(3):
+            v = position[i]
+            if self.last_change_gcode_offset is not None:
+                v += self.last_change_gcode_offset[i]
             if tool:
-                offset = 0.
-                if index == 0:
-                    offset = tool.gcode_x_offset
-                elif index == 1:
-                    offset = tool.gcode_y_offset
-                elif index == 2:
-                    offset = tool.gcode_z_offset + extra_z_offset
-                v += offset
-            result[INDEX_TO_XYZ[index]] = v
+                if i == 0:
+                    v += tool.gcode_x_offset
+                elif i == 1:
+                    v += tool.gcode_y_offset
+                elif i == 2:
+                    v += tool.gcode_z_offset
+            result.append(v)
+        result.extend(position[3:])
         return result
 
-    def _restore_axis(self, position, axis, tool):
-        if not axis:
-            return
-        pos = self._position_with_tool_offset(position, axis, tool)
-        self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", pos))
+    def _save_state(self, restore_axis, tool):
+        """What is going on here:
+         - toolhead position - the position of the toolhead mount relative to homing sensors.
+         - gcode position - the position of the nozzle, relative to the bed;
+             since each tool has a slightly different geometry, each tool has a set of gcode offsets that determine the delta.
+        Normally gcode commands use gcode position, but that can mean different toolhead positions depending on
+        which tool is mounted, making tool changes unreliable.
+        To solve that, during toolchange Gcode offsets are set to zero and the gcode moves directly work with toolhead position.
+        And the nozzle location will deviate for each tool.
+
+        To restore the new tool's nozzle to where the previous tool left off, the restore position is manually computed in the code below.
+        """
+        gcode_status = self.gcode_move.get_status()
+
+        self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=_toolchange_state")
+        self.last_change_pickup_tool = tool
+        self.last_change_gcode_position = list(gcode_status['gcode_position'])
+        self.last_change_gcode_offset = gcode_status['homing_origin']
+        self.last_change_restore_axis = restore_axis
+
+    def _set_toolchange_transform(self):
+        self.gcode_transform.tool = None
+        self.gcode_move.reset_last_position()
+        self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0.0 Y=0.0 Z=0.0")
+
+    def _restore_state_and_transform(self, tool):
+        self.gcode_transform.tool = tool
+        self.gcode_move.reset_last_position()
+        self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=_toolchange_state MOVE=0")
+        self.last_change_gcode_offset = None
+        if self.last_change_restore_axis:
+            self._restore_axis(self.last_change_gcode_position, self.last_change_restore_axis)
+            self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=_toolchange_state MOVE=0")
+
+    def _restore_axis(self, position, axis):
+        pos = self._position_with_tool_offset(position, None)
+        self.gcode.run_script_from_command("G90")
+        self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", self._position_to_xyz(pos, axis)))
 
     def run_gcode(self, name, template, extra_context):
-        current_status = self.status
         curtime = self.printer.get_reactor().monotonic()
         context = {
             **template.create_template_context(),
@@ -586,24 +682,35 @@ class Toolchanger:
     def cmd_SET_TOOL_PARAMETER(self, gcmd):
         tool = self._get_tool_from_gcmd(gcmd)
         name = gcmd.get("PARAMETER")
-        if name in tool.params and name not in tool.original_params:
-            tool.original_params[name] = tool.params[name]
         value = ast.literal_eval(gcmd.get("VALUE"))
-        tool.params[name] = value
+        tool.set_parameter(name, value)
 
     def cmd_RESET_TOOL_PARAMETER(self, gcmd):
         tool = self._get_tool_from_gcmd(gcmd)
         name = gcmd.get("PARAMETER")
-        if name in tool.original_params:
-            tool.params[name] = tool.original_params[name]
+        tool.reset_parameter(name)
 
     def cmd_SAVE_TOOL_PARAMETER(self, gcmd):
         tool = self._get_tool_from_gcmd(gcmd)
         name = gcmd.get("PARAMETER")
         if name not in tool.params:
             raise gcmd.error('Tool does not have parameter %s' % (name))
-        configfile = self.printer.lookup_object('configfile')
-        configfile.set(tool.name, name, tool.params[name])
+        tool.save_parameter(name)
+
+    def cmd_ADJUST_Z_AFTER_TOOL_NOZZLE_HOME(self, gcmd):
+        tool = self.active_tool
+        if not tool:
+            raise gcmd.error("ADJUST_Z_AFTER_TOOL_NOZZLE_HOME - no active tool")
+        self._adjust_z_position_for_tool(tool)
+
+    def _adjust_z_position_for_tool(self, tool):
+        z_offset = tool.gcode_z_offset
+        if z_offset != 0.0:
+            logging.info(f"Toolchanger: Adjusting Z position after homing move by {z_offset}")
+            toolhead = self.printer.lookup_object('toolhead')
+            pos = list(toolhead.get_position())
+            pos[2] += z_offset
+            toolhead.set_position(pos)
 
     def ensure_homed(self, gcmd):
         if not self.uses_axis:
@@ -722,6 +829,23 @@ class FanSwitcher:
         else:
             self.pending_speed = speed
 
+# Helper class for applying tool offset
+class ToolGcodeTransform:
+    def __init__(self):
+        self.next_transform = None
+        self.tool = None
+
+    def move(self, newpos, speed):
+        if not self.tool:
+            return self.next_transform.move(newpos, speed)
+        transformed_pos = [newpos[0] + self.tool.gcode_x_offset, newpos[1] + self.tool.gcode_y_offset, newpos[2] + self.tool.gcode_z_offset] + newpos[3:]
+        return self.next_transform.move(transformed_pos, speed)
+
+    def get_position(self):
+        base_pos = self.next_transform.get_position()
+        if not self.tool:
+            return base_pos
+        return [base_pos[0] - self.tool.gcode_x_offset, base_pos[1] - self.tool.gcode_y_offset, base_pos[2] - self.tool.gcode_z_offset] + base_pos[3:]
 
 def get_params_dict(config):
     result = {}
