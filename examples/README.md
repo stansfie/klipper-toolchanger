@@ -52,6 +52,10 @@ Suitable for fixed gantry printers, like Voron Trident.
 A system where tools are lowered via a separate lifter rail, but the tool change itself
 is handled by only moving the toolhead.
 
+See [`liftbar/`](liftbar/) for a complete real-world example (Voron 2.4 / StealthChanger,
+dual liftbar rails): liftbar macros, panel limit handling, homing the liftbar before
+power-off, and per-tool offset calibration.
+
 ## Tool mounting system
 
 Select a mounting routine, depending on your tool mounting system.
